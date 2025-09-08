@@ -98,6 +98,15 @@ Require CI checks to pass before merging:
   -RequireCI `
   -RequiredChecks "build","test"
 ```
+.\Check-in\Setup-And-CheckIn.ps1 `
+  -Org "ChessDev-Hub" `
+  -Repo "sus-scanner-api" `
+  -Private `
+  -InitGit `
+  -CreateRepo `
+  -CommitMessage "api: initial FastAPI scaffold" `
+  -OpenPR `
+  -Reviewers "ChessDev-Hub/dev1","ChessDev-Hub/dev2"
 
 ---
 
