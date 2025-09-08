@@ -1,0 +1,10 @@
+# OS / Editor
+.DS_Store
+*.code-workspace
+.vscode/
+# Python
+__pycache__/
+*.pyc
+.venv/
+# Node
+node_modules/
