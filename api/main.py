@@ -1,3 +1,5 @@
+# SENTINEL: SusScanner main.py v2 (lazy-load)
+
 import os
 import importlib
 from typing import Any, Dict, Optional
@@ -45,6 +47,19 @@ router = APIRouter()
 def health() -> Dict[str, bool]:
     return {"ok": True}
 
+# Optional debug endpoint to see what's loaded and the prefix being used.
+@router.get("/debug")
+def debug() -> Dict[str, str]:
+    return {
+        "api_prefix": API_PREFIX or "",
+        "loaded": str(_loaded),
+        "has_analyze_fn": str(_analyze_fn is not None),
+        "has_scanner_cls": str(_ScannerCls is not None),
+        "file": __file__,
+        "origins": ",".join(origins),
+        "scanner_module": _scanner_modname or "",
+    }
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Lazy load scanner from multiple possible module paths
 # ──────────────────────────────────────────────────────────────────────────────
@@ -52,22 +67,25 @@ def health() -> Dict[str, bool]:
 _ScannerCls: Optional[type] = None
 _analyze_fn = None
 _loaded = False
+_scanner_modname: Optional[str] = None
 
 def _import_first(*module_names: str):
     last_err = None
     for name in module_names:
         try:
-            return importlib.import_module(name)
+            mod = importlib.import_module(name)
+            # print is fine for Render logs
+            print(f"[sus-scanner] using scanner module: {name}")
+            return name, mod
         except Exception as e:
             last_err = e
-    # If everything failed, re-raise the last error to help debugging
     if last_err:
         raise last_err
     raise ImportError("No module names provided")
 
 def _load_scanner_once() -> None:
     """Load either a function analyze_user/analyze_player or a SusScanner class."""
-    global _ScannerCls, _analyze_fn, _loaded
+    global _ScannerCls, _analyze_fn, _loaded, _scanner_modname
     if _loaded:
         return
 
@@ -75,7 +93,8 @@ def _load_scanner_once() -> None:
     # - "scanner"                  (single-file module)
     # - "services.scanner"         (monorepo/services layout)
     # - "api.scanner"              (some repos keep logic under api/)
-    mod = _import_first("scanner", "services.scanner", "api.scanner")
+    modname, mod = _import_first("scanner", "services.scanner", "api.scanner")
+    _scanner_modname = modname
 
     _ScannerCls = getattr(mod, "SusScanner", None)
     # Prefer analyze_user, then analyze_player
@@ -94,7 +113,7 @@ def _to_json(obj: Any) -> Dict[str, Any]:
     if isinstance(obj, dict):
         return obj
     if hasattr(obj, "model_dump"):
-        return obj.model_dump()
+        return obj.model_dump()  # pydantic v2 models
     if hasattr(obj, "__dict__"):
         return {k: v for k, v in vars(obj).items() if not k.startswith("_")}
     return {"result": str(obj)}
@@ -109,7 +128,7 @@ def scan(req: ScanRequest) -> Dict[str, Any]:
     if not username:
         raise HTTPException(400, "username is required")
 
-    # Forward USER_EMAIL env if present (your code had this behavior)
+    # Forward USER_EMAIL env if present (kept from your earlier code)
     ua_email = os.getenv("USER_EMAIL")
     if ua_email:
         os.environ["USER_EMAIL"] = ua_email
@@ -117,7 +136,6 @@ def scan(req: ScanRequest) -> Dict[str, Any]:
     try:
         _load_scanner_once()
     except Exception as e:
-        # Surface import errors clearly (helps when the UI “spins forever”)
         raise HTTPException(500, f"failed to import scanner module: {e}")
 
     # 1) function-style API
