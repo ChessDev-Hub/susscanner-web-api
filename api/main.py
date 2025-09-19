@@ -1,18 +1,36 @@
+import os
+import importlib
+from typing import Any, Dict, Optional
 
-import os, importlib
-from typing import Any, Dict
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Allow overriding with comma-separated env var:
+#   CORS_ORIGINS="https://chessdev-hub.github.io, http://localhost:5173"
 origins_env = os.getenv("CORS_ORIGINS", "")
-origins = [o.strip() for o in origins_env.split(",") if o.strip()] or [
-    "http://localhost:3000","http://127.0.0.1:3000",
-    "http://localhost:5173","http://127.0.0.1:5173",
+
+# Default origins cover local dev AND your GitHub Pages site.
+DEFAULT_ORIGINS = [
+    "http://localhost:3000", "http://127.0.0.1:3000",
+    "http://localhost:5173", "http://127.0.0.1:5173",
+    "https://chessdev-hub.github.io",
 ]
 
-app = FastAPI(title="Sus Scanner API")
+origins = [o.strip() for o in origins_env.split(",") if o.strip()] or DEFAULT_ORIGINS
 
+# Optional API prefix, e.g. "/api"
+API_PREFIX = os.getenv("API_PREFIX", "").strip()  # "" or "/api"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# App + CORS
+# ──────────────────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Sus Scanner API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -21,49 +39,88 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/health")
+router = APIRouter()
+
+@router.get("/health")
 def health() -> Dict[str, bool]:
     return {"ok": True}
 
-_ScannerCls = None
+# ──────────────────────────────────────────────────────────────────────────────
+# Lazy load scanner from multiple possible module paths
+# ──────────────────────────────────────────────────────────────────────────────
+
+_ScannerCls: Optional[type] = None
 _analyze_fn = None
 _loaded = False
 
+def _import_first(*module_names: str):
+    last_err = None
+    for name in module_names:
+        try:
+            return importlib.import_module(name)
+        except Exception as e:
+            last_err = e
+    # If everything failed, re-raise the last error to help debugging
+    if last_err:
+        raise last_err
+    raise ImportError("No module names provided")
+
 def _load_scanner_once() -> None:
+    """Load either a function analyze_user/analyze_player or a SusScanner class."""
     global _ScannerCls, _analyze_fn, _loaded
-    if _loaded: return
-    try:
-        mod = importlib.import_module("scanner")
-        _ScannerCls = getattr(mod, "SusScanner", None)
-        _analyze_fn = (
-            getattr(mod, "analyze_user", None)
-            or getattr(mod, "analyze_player", None)
-        )
-    except Exception:
-        pass
+    if _loaded:
+        return
+
+    # Try several common locations
+    # - "scanner"                  (single-file module)
+    # - "services.scanner"         (monorepo/services layout)
+    # - "api.scanner"              (some repos keep logic under api/)
+    mod = _import_first("scanner", "services.scanner", "api.scanner")
+
+    _ScannerCls = getattr(mod, "SusScanner", None)
+    # Prefer analyze_user, then analyze_player
+    _analyze_fn = getattr(mod, "analyze_user", None) or getattr(mod, "analyze_player", None)
+
     _loaded = True
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Models + helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
 class ScanRequest(BaseModel):
     username: str
 
 def _to_json(obj: Any) -> Dict[str, Any]:
-    if isinstance(obj, dict): return obj
-    if hasattr(obj, "model_dump"): return obj.model_dump()
+    if isinstance(obj, dict):
+        return obj
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
     if hasattr(obj, "__dict__"):
         return {k: v for k, v in vars(obj).items() if not k.startswith("_")}
     return {"result": str(obj)}
 
-@app.post("/scan")
+# ──────────────────────────────────────────────────────────────────────────────
+# Routes
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.post("/scan")
 def scan(req: ScanRequest) -> Dict[str, Any]:
     username = (req.username or "").strip()
     if not username:
         raise HTTPException(400, "username is required")
 
+    # Forward USER_EMAIL env if present (your code had this behavior)
     ua_email = os.getenv("USER_EMAIL")
-    if ua_email: os.environ["USER_EMAIL"] = ua_email
+    if ua_email:
+        os.environ["USER_EMAIL"] = ua_email
 
-    _load_scanner_once()
+    try:
+        _load_scanner_once()
+    except Exception as e:
+        # Surface import errors clearly (helps when the UI “spins forever”)
+        raise HTTPException(500, f"failed to import scanner module: {e}")
 
+    # 1) function-style API
     if _analyze_fn is not None:
         try:
             metrics = _analyze_fn(username)
@@ -71,6 +128,7 @@ def scan(req: ScanRequest) -> Dict[str, Any]:
             raise HTTPException(500, f"analyze function failed: {e}")
         return _to_json(metrics)
 
+    # 2) class-style API
     if _ScannerCls is not None:
         try:
             scanner = _ScannerCls(lookback_months=3, wr_gap_suspect=0.25)
@@ -79,14 +137,17 @@ def scan(req: ScanRequest) -> Dict[str, Any]:
             elif hasattr(scanner, "analyze_player"):
                 metrics = scanner.analyze_player(username)
             else:
-                raise HTTPException(500, "scanner lacks analyze_user/analyze_player")
+                raise HTTPException(500, "SusScanner lacks analyze_user/analyze_player")
         except Exception as e:
             raise HTTPException(500, f"scanner failed: {e}")
         return _to_json(metrics)
 
     raise HTTPException(
         500,
-        "scanner.py not loaded: define class `SusScanner` (.analyze_user) or "
-        "export `analyze_user(name)` / `analyze_player(name)`."
+        "scanner module loaded but no entrypoints found. "
+        "Define class `SusScanner` (.analyze_user/.analyze_player) or export "
+        "`analyze_user(name)` / `analyze_player(name)`."
     )
 
+# Mount router (with optional prefix)
+app.include_router(router, prefix=API_PREFIX)
